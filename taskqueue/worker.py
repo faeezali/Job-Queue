@@ -97,6 +97,8 @@ def run_once(
         )
 
     elapsed_ms = (time.perf_counter() - started) * 1000
+    if not written:
+        outcome = f"{outcome}, not recorded"
     log.info(
         "job %d %s attempt %d/%d took %.1f ms: %s",
         job.id,
@@ -108,8 +110,8 @@ def run_once(
     )
     if not written:
         log.warning(
-            "job %d: lease lost before attempt %d was recorded; another worker owns it now,"
-            " so this outcome was discarded",
+            "job %d: lease lost before attempt %d was recorded (it expired and the job was"
+            " reclaimed or failed); this attempt's outcome was discarded",
             job.id,
             job.attempts,
         )

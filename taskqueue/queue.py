@@ -151,7 +151,7 @@ def claim_next(db: DbPath, *, worker_id: str, now: float, lease_seconds: float) 
 def _fail_exhausted_leases(conn: sqlite3.Connection, now: float) -> None:
     """Fail running jobs whose lease expired on their last allowed attempt."""
     expired = conn.execute(
-        "SELECT id, worker_id, attempts, max_attempts, lease_expires_at FROM jobs"
+        "SELECT id, worker_id, attempts, max_attempts FROM jobs"
         " WHERE status = 'running' AND lease_expires_at <= ? AND attempts >= max_attempts",
         (now,),
     ).fetchall()

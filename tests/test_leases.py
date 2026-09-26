@@ -146,6 +146,8 @@ def test_worker_logs_a_warning_when_its_lease_was_lost(
     with caplog.at_level("INFO", logger="taskqueue"):
         assert run_once(db_path, worker_id="w1", now_fn=clock, handlers=handlers) is True
     assert f"job {job_id}: lease lost before attempt 1 was recorded" in caplog.text
+    assert f"job {job_id} sleep attempt 1/2 took" in caplog.text
+    assert "ms: done, not recorded" in caplog.text
     current = job(db_path, job_id)
     assert (current.status, current.worker_id, current.attempts, current.result) == (
         "running",

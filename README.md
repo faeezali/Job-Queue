@@ -20,6 +20,7 @@ Requires Python 3.10 or later.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
+python -m pip install --upgrade pip   # editable installs need pip >= 21.3
 pip install -e ".[dev]"
 pytest -q
 

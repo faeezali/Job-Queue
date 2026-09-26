@@ -221,6 +221,10 @@ taken.
   are unsafe there, because the handler can interrupt a write already in progress on
   the same stream. The worker checks the flag between jobs and never blocks in
   `Event.wait()`. The previous signal handlers are restored when the worker returns.
+- **Database errors stop the worker.** A worker exits with code 1 when SQLite raises,
+  for example when the write lock is still held after the 10 s busy timeout. It does not
+  loop on the error. A job it had claimed stays `running` and is reclaimed when its
+  lease expires.
 - **`RetryPolicy` validates its fields.** Delays must be finite and at least 0, and
   jitter must be between 0 and 1. It caps the exponent at 64 so huge attempt numbers
   cannot overflow. A base delay of 0 is allowed, and the CLI tests use it to retry
