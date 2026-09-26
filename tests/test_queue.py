@@ -12,13 +12,16 @@ from conftest import FakeClock
 from taskqueue.db import connect
 from taskqueue.errors import UnknownJobTypeError
 from taskqueue.queue import (
+    Job,
     claim_next,
     complete_job,
+    count_by_status,
     enqueue,
     get_job,
     has_unfinished,
     list_jobs,
     record_failure,
+    requeue,
 )
 
 
@@ -140,15 +143,70 @@ def test_complete_job_stores_result(db_path: Path, clock: FakeClock) -> None:
     )
 
 
-def test_record_failure_is_terminal(db_path: Path, clock: FakeClock) -> None:
-    enqueue(db_path, "sleep", {"seconds": 0}, now_fn=clock)
+def claimed(db_path: Path, clock: FakeClock, max_attempts: int = 1) -> Job:
+    enqueue(db_path, "sleep", {"seconds": 0}, max_attempts=max_attempts, now_fn=clock)
     job = claim_next(db_path, worker_id="w", now=clock(), lease_seconds=30)
     assert job is not None
-    assert record_failure(db_path, job.id, worker_id="w", attempt=1, error="X: y", now=101.0)
+    return job
+
+
+def test_record_failure_without_retry_at_is_terminal(db_path: Path, clock: FakeClock) -> None:
+    job = claimed(db_path, clock)
+    assert record_failure(
+        db_path, job.id, worker_id="w", attempt=1, error="X: y", retry_at=None, now=101.0
+    )
     failed = get_job(db_path, job.id)
     assert failed is not None
     assert (failed.status, failed.last_error, failed.finished_at) == ("failed", "X: y", 101.0)
     assert failed.worker_id is failed.lease_expires_at is None
+
+
+def test_record_failure_with_retry_at_goes_back_to_pending(db_path: Path, clock: FakeClock) -> None:
+    job = claimed(db_path, clock, max_attempts=2)
+    assert record_failure(
+        db_path, job.id, worker_id="w", attempt=1, error="X: y", retry_at=150.0, now=101.0
+    )
+    waiting = get_job(db_path, job.id)
+    assert waiting is not None
+    assert (waiting.status, waiting.attempts, waiting.available_at) == ("pending", 1, 150.0)
+    assert waiting.last_error == "X: y"
+    assert waiting.worker_id is waiting.lease_expires_at is waiting.finished_at is None
+
+
+def test_requeue_resets_a_failed_job(db_path: Path, clock: FakeClock) -> None:
+    job = claimed(db_path, clock, max_attempts=2)
+    record_failure(db_path, job.id, worker_id="w", attempt=1, error="E", retry_at=None, now=101.0)
+    assert requeue(db_path, job.id, now=200.0) is True
+    fresh = get_job(db_path, job.id)
+    assert fresh is not None
+    assert (fresh.status, fresh.attempts, fresh.max_attempts, fresh.available_at) == (
+        "pending",
+        0,
+        2,
+        200.0,
+    )
+    assert fresh.last_error is fresh.result is fresh.started_at is fresh.finished_at is None
+    assert fresh.worker_id is fresh.lease_expires_at is None
+    assert fresh.created_at == 100.0
+
+
+def test_requeue_only_accepts_failed_jobs(db_path: Path, clock: FakeClock) -> None:
+    running = claimed(db_path, clock)
+    done = claimed(db_path, clock)
+    complete_job(db_path, done.id, worker_id="w", attempt=1, result={}, now=clock())
+    pending_id = enqueue(db_path, "sleep", {"seconds": 0}, now_fn=clock)
+    ids = (running.id, done.id, pending_id)
+    before = [get_job(db_path, job_id) for job_id in ids]
+    for job_id in (*ids, 999):
+        assert requeue(db_path, job_id, now=200.0) is False
+    assert [get_job(db_path, job_id) for job_id in ids] == before
+
+
+def test_count_by_status_is_zero_filled(db_path: Path, clock: FakeClock) -> None:
+    assert count_by_status(db_path) == {"pending": 0, "running": 0, "done": 0, "failed": 0}
+    claimed(db_path, clock)
+    enqueue(db_path, "sleep", {"seconds": 0}, now_fn=clock)
+    assert count_by_status(db_path) == {"pending": 1, "running": 1, "done": 0, "failed": 0}
 
 
 def test_get_job_missing_returns_none(db_path: Path) -> None:

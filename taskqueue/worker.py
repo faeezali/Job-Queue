@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import socket
 import time
 from collections.abc import Callable, Mapping
@@ -18,6 +19,7 @@ from taskqueue.db import DbPath
 from taskqueue.errors import InvalidResult, UnknownJobTypeError
 from taskqueue.handlers import HANDLERS, HandlerSpec, JobContext
 from taskqueue.queue import Job, claim_next, complete_job, has_unfinished, record_failure
+from taskqueue.retry import DEFAULT_RETRY_POLICY, RetryPolicy, is_retryable
 
 log = logging.getLogger(__name__)
 
@@ -50,10 +52,18 @@ def run_once(
     *,
     worker_id: str,
     now_fn: Callable[[], float] = time.time,
+    rand_fn: Callable[[], float] = random.random,
     lease_seconds: float = 30.0,
+    retry_policy: RetryPolicy = DEFAULT_RETRY_POLICY,
     handlers: Mapping[str, HandlerSpec] = HANDLERS,
 ) -> bool:
-    """Claim and process one job. Return False if no job was ready."""
+    """Claim and process one job. Return False if no job was ready.
+
+    A failure is retried (the job goes back to pending with a backoff delay)
+    when the error is retryable and attempts remain; otherwise it is final.
+    The worker never sleeps here: the delay is stored as the job's
+    available_at, so the worker is immediately free for other ready jobs.
+    """
     job = claim_next(db, worker_id=worker_id, now=now_fn(), lease_seconds=lease_seconds)
     if job is None:
         return False
@@ -63,9 +73,22 @@ def run_once(
         result = _execute(job, handlers)
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
-        outcome = f"failed ({error})"
+        now = now_fn()
+        retry_at: float | None = None
+        if is_retryable(exc) and job.attempts < job.max_attempts:
+            delay = retry_policy.next_delay(job.attempts, rand_fn())
+            retry_at = now + delay
+            outcome = f"retry in {delay:.1f}s ({error})"
+        else:
+            outcome = f"failed ({error})"
         written = record_failure(
-            db, job.id, worker_id=worker_id, attempt=job.attempts, error=error, now=now_fn()
+            db,
+            job.id,
+            worker_id=worker_id,
+            attempt=job.attempts,
+            error=error,
+            retry_at=retry_at,
+            now=now,
         )
     else:
         outcome = "done"
@@ -75,13 +98,13 @@ def run_once(
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     log.info(
-        "job %d %s attempt %d/%d %s in %.1f ms",
+        "job %d %s attempt %d/%d took %.1f ms: %s",
         job.id,
         job.type,
         job.attempts,
         job.max_attempts,
-        outcome,
         elapsed_ms,
+        outcome,
     )
     if not written:
         log.warning(

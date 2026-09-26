@@ -132,9 +132,52 @@ def test_worker_processes_jobs_and_exits_0(db_path: Path) -> None:
     assert [(j.status, j.worker_id) for j in jobs] == [("done", "cli-test")] * 2
 
 
+def test_retry_requeues_a_failed_job(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    run(db_path, "submit", "csv_summary", "--path", str(SAMPLES / "malformed.csv"))
+    run(db_path, "worker", "--exit-when-idle")
+    capsys.readouterr()
+    assert run(db_path, "retry", "1") == 0
+    assert capsys.readouterr().out == "job 1 requeued\n"
+    job = get_job(db_path, 1)
+    assert job is not None and (job.status, job.attempts, job.last_error) == ("pending", 0, None)
+
+
+def test_retry_rejects_unfailed_and_missing_jobs(
+    db_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    run(db_path, "submit", "sleep", "--payload", '{"seconds": 0}')
+    capsys.readouterr()
+    assert run(db_path, "retry", "1") == 2
+    assert "job 1 is pending; only failed jobs can be retried" in capsys.readouterr().err
+    assert run(db_path, "retry", "7") == 1
+    assert "job 7 not found" in capsys.readouterr().err
+
+
+def test_stats_counts_every_status(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    run(db_path, "submit", "csv_summary", "--path", str(SAMPLES / "orders.csv"))
+    run(db_path, "submit", "csv_summary", "--path", str(SAMPLES / "malformed.csv"))
+    run(db_path, "worker", "--exit-when-idle")
+    run(db_path, "submit", "sleep", "--payload", '{"seconds": 0}')
+    capsys.readouterr()
+    assert run(db_path, "stats") == 0
+    assert capsys.readouterr().out == (
+        "pending  1\nrunning  0\ndone     1\nfailed   1\ntotal    3\n"
+    )
+
+
+def test_worker_retries_with_configurable_backoff(db_path: Path) -> None:
+    run(db_path, "submit", "flaky", "--payload", '{"fail_times": 2}', "--max-attempts", "3")
+    # --retry-base 0 makes the backoff zero, so the retries happen without real waiting.
+    assert run(db_path, "worker", "--exit-when-idle", "--retry-base", "0") == 0
+    job = get_job(db_path, 1)
+    assert job is not None
+    assert (job.status, job.attempts, job.result) == ("done", 3, {"succeeded_on_attempt": 3})
+
+
 def test_worker_rejects_bad_options(db_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert run(db_path, "worker", "--max-jobs", "0") == 2
     assert run(db_path, "worker", "--poll-interval", "-1") == 2
+    assert run(db_path, "worker", "--retry-base", "-1") == 2
     run(db_path, "submit", "sleep", "--payload", '{"seconds": 0}')
     assert run(db_path, "worker", "--lease-seconds", "0", "--exit-when-idle") == 2
     assert "Traceback" not in capsys.readouterr().err

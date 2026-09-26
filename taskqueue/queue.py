@@ -152,16 +152,50 @@ def complete_job(
 
 
 def record_failure(
-    db: DbPath, job_id: int, *, worker_id: str, attempt: int, error: str, now: float
+    db: DbPath,
+    job_id: int,
+    *,
+    worker_id: str,
+    attempt: int,
+    error: str,
+    retry_at: float | None,
+    now: float,
 ) -> bool:
-    """Mark the attempt failed with `error`; return False if the lease was lost."""
+    """Record a failed attempt; return False if the lease was lost.
+
+    With `retry_at=None` the job fails for good; otherwise it goes back to
+    pending and becomes claimable again at `retry_at`.
+    """
     with closing(connect(db)) as conn:
         with transaction(conn):
+            if retry_at is None:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'failed', last_error = ?, lease_expires_at = NULL,"
+                    " worker_id = NULL, finished_at = ?"
+                    " WHERE id = ? AND status = 'running' AND worker_id = ? AND attempts = ?",
+                    (error, now, job_id, worker_id, attempt),
+                )
+            else:
+                cursor = conn.execute(
+                    "UPDATE jobs SET status = 'pending', available_at = ?, last_error = ?,"
+                    " lease_expires_at = NULL, worker_id = NULL"
+                    " WHERE id = ? AND status = 'running' AND worker_id = ? AND attempts = ?",
+                    (retry_at, error, job_id, worker_id, attempt),
+                )
+    return cursor.rowcount == 1
+
+
+def requeue(db: DbPath, job_id: int, *, now: float) -> bool:
+    """Reset a failed job to a fresh pending job; return False if it isn't failed."""
+    with closing(connect(db)) as conn:
+        with transaction(conn):
+            # attempts restarts at 0 so the job gets its full max_attempts budget again.
             cursor = conn.execute(
-                "UPDATE jobs SET status = 'failed', last_error = ?, lease_expires_at = NULL,"
-                " worker_id = NULL, finished_at = ?"
-                " WHERE id = ? AND status = 'running' AND worker_id = ? AND attempts = ?",
-                (error, now, job_id, worker_id, attempt),
+                "UPDATE jobs SET status = 'pending', attempts = 0, available_at = ?,"
+                " last_error = NULL, result_json = NULL, started_at = NULL, finished_at = NULL,"
+                " lease_expires_at = NULL, worker_id = NULL"
+                " WHERE id = ? AND status = 'failed'",
+                (now, job_id),
             )
     return cursor.rowcount == 1
 
@@ -187,6 +221,15 @@ def list_jobs(db: DbPath, *, status: str | None = None, limit: int = 50) -> list
                 "SELECT * FROM jobs WHERE status = ? ORDER BY id DESC LIMIT ?", (status, limit)
             )
         return [Job.from_row(row) for row in rows]
+
+
+def count_by_status(db: DbPath) -> dict[str, int]:
+    """Return the number of jobs in each status, including zeros."""
+    counts = dict.fromkeys(STATUSES, 0)
+    with closing(connect(db)) as conn:
+        for row in conn.execute("SELECT status, COUNT(*) AS n FROM jobs GROUP BY status"):
+            counts[row["status"]] = row["n"]
+    return counts
 
 
 def has_unfinished(db: DbPath) -> bool:

@@ -1,4 +1,4 @@
-"""Command-line interface: `taskqueue submit | list | show | worker`.
+"""Command-line interface: `taskqueue submit | list | show | retry | stats | worker`.
 
 The only module that prints. Exit codes: 0 success, 1 job not found or a
 database/OS error, 2 bad user input.
@@ -17,7 +17,16 @@ from collections.abc import Callable, Sequence
 from dataclasses import asdict
 
 from taskqueue.db import init_db
-from taskqueue.queue import STATUSES, Job, enqueue, get_job, list_jobs
+from taskqueue.queue import (
+    STATUSES,
+    Job,
+    count_by_status,
+    enqueue,
+    get_job,
+    list_jobs,
+    requeue,
+)
+from taskqueue.retry import RetryPolicy
 from taskqueue.worker import default_worker_id, run_worker
 
 EXIT_OK = 0
@@ -103,7 +112,30 @@ def cmd_show(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_retry(args: argparse.Namespace) -> int:
+    if requeue(args.db, args.id, now=time.time()):
+        print(f"job {args.id} requeued")
+        return EXIT_OK
+    job = get_job(args.db, args.id)
+    if job is None:
+        _error(f"job {args.id} not found")
+        return EXIT_NOT_FOUND
+    _error(f"job {args.id} is {job.status}; only failed jobs can be retried")
+    return EXIT_USAGE
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    counts = count_by_status(args.db)
+    rows = [(status, str(count)) for status, count in counts.items()]
+    rows.append(("total", str(sum(counts.values()))))
+    width = max(len(status) for status, _ in rows)
+    for status, count in rows:
+        print(f"{status.ljust(width)}  {count}")
+    return EXIT_OK
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
+    retry_policy = RetryPolicy(base_delay=args.retry_base, max_delay=args.retry_max)
     run_worker(
         args.db,
         worker_id=args.worker_id or default_worker_id(),
@@ -111,6 +143,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         exit_when_idle=args.exit_when_idle,
         max_jobs=args.max_jobs,
         lease_seconds=args.lease_seconds,
+        retry_policy=retry_policy,
     )
     return EXIT_OK
 
@@ -145,6 +178,13 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("id", type=int)
     show.set_defaults(func=cmd_show)
 
+    retry = commands.add_parser("retry", help="requeue a failed job with a fresh attempt budget")
+    retry.add_argument("id", type=int)
+    retry.set_defaults(func=cmd_retry)
+
+    stats = commands.add_parser("stats", help="count jobs by status")
+    stats.set_defaults(func=cmd_stats)
+
     worker = commands.add_parser("worker", help="process jobs until stopped")
     worker.add_argument("--worker-id", help="default: HOSTNAME-PID")
     worker.add_argument("--lease-seconds", type=float, default=30.0, help="default: 30")
@@ -153,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--exit-when-idle", action="store_true", help="exit once nothing is pending or running"
     )
     worker.add_argument("--max-jobs", type=int, help="exit after processing this many jobs")
+    worker.add_argument(
+        "--retry-base", type=float, default=2.0, help="first retry delay in seconds (default: 2)"
+    )
+    worker.add_argument(
+        "--retry-max", type=float, default=60.0, help="longest retry delay (default: 60)"
+    )
     worker.set_defaults(func=cmd_worker)
     return parser
 

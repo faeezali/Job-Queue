@@ -10,12 +10,15 @@ from taskqueue.queue import (
     Job,
     claim_next,
     complete_job,
+    count_by_status,
     enqueue,
     get_job,
     has_unfinished,
     list_jobs,
     record_failure,
+    requeue,
 )
+from taskqueue.retry import RetryPolicy, is_retryable
 from taskqueue.worker import run_once, run_worker
 
 __version__ = "0.1.0"
@@ -28,15 +31,19 @@ __all__ = [
     "HandlerSpec",
     "Job",
     "JobContext",
+    "RetryPolicy",
     "__version__",
     "claim_next",
     "complete_job",
+    "count_by_status",
     "enqueue",
     "get_job",
     "has_unfinished",
     "init_db",
+    "is_retryable",
     "list_jobs",
     "record_failure",
+    "requeue",
     "run_once",
     "run_worker",
     "summarize_csv",
