@@ -104,18 +104,26 @@ def enqueue(
 
 
 def claim_next(db: DbPath, *, worker_id: str, now: float, lease_seconds: float) -> Job | None:
-    """Atomically take the oldest ready pending job and lease it to `worker_id`.
+    """Atomically lease the oldest claimable job to `worker_id`, or return None.
 
-    Returns None when no job is ready at `now`.
+    A job is claimable if it is pending and ready (available_at <= now), or if
+    it is running but its lease has expired, meaning its worker died or hung.
+    Expired jobs with no attempts left are failed with a LeaseExpired error
+    instead of being handed out again.
     """
     if not _is_real(lease_seconds) or lease_seconds <= 0:
         raise ValueError(f"lease_seconds must be a positive number, got {lease_seconds!r}")
     with closing(connect(db)) as conn:
+        # One IMMEDIATE transaction: the write lock is held from the first
+        # SELECT to the UPDATE, so no other process can claim the same row.
         with transaction(conn):
+            _fail_exhausted_leases(conn, now)
             row = conn.execute(
-                "SELECT id FROM jobs WHERE status = 'pending' AND available_at <= ?"
+                "SELECT id, status, worker_id FROM jobs"
+                " WHERE (status = 'pending' AND available_at <= ?)"
+                " OR (status = 'running' AND lease_expires_at <= ?)"
                 " ORDER BY id LIMIT 1",
-                (now,),
+                (now, now),
             ).fetchone()
             if row is None:
                 return None
@@ -126,8 +134,38 @@ def claim_next(db: DbPath, *, worker_id: str, now: float, lease_seconds: float) 
             )
             claimed = conn.execute("SELECT * FROM jobs WHERE id = ?", (row["id"],)).fetchone()
     job = Job.from_row(claimed)
-    log.debug("worker %s claimed job %d attempt %d", worker_id, job.id, job.attempts)
+    if row["status"] == "running":
+        log.warning(
+            "job %d: lease held by %s expired; reclaimed by %s as attempt %d/%d",
+            job.id,
+            row["worker_id"],
+            worker_id,
+            job.attempts,
+            job.max_attempts,
+        )
+    else:
+        log.debug("worker %s claimed job %d attempt %d", worker_id, job.id, job.attempts)
     return job
+
+
+def _fail_exhausted_leases(conn: sqlite3.Connection, now: float) -> None:
+    """Fail running jobs whose lease expired on their last allowed attempt."""
+    expired = conn.execute(
+        "SELECT id, worker_id, attempts, max_attempts, lease_expires_at FROM jobs"
+        " WHERE status = 'running' AND lease_expires_at <= ? AND attempts >= max_attempts",
+        (now,),
+    ).fetchall()
+    for row in expired:
+        error = (
+            f"LeaseExpired: worker {row['worker_id']} did not finish attempt "
+            f"{row['attempts']}/{row['max_attempts']} before its lease expired"
+        )
+        conn.execute(
+            "UPDATE jobs SET status = 'failed', last_error = ?, lease_expires_at = NULL,"
+            " worker_id = NULL, finished_at = ? WHERE id = ?",
+            (error, now, row["id"]),
+        )
+        log.warning("job %d failed: %s", row["id"], error)
 
 
 # complete_job and record_failure are fenced: the WHERE clause matches only if

@@ -10,11 +10,14 @@ import argparse
 import json
 import logging
 import os
+import signal
 import sqlite3
 import sys
+import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import asdict
+from types import FrameType
 
 from taskqueue.db import init_db
 from taskqueue.queue import (
@@ -134,17 +137,55 @@ def cmd_stats(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+STOP_MESSAGE = b"taskqueue: stop requested; finishing the current job (Ctrl-C again to abort)\n"
+
+
+def make_stop_handler(stop: threading.Event) -> Callable[[int, FrameType | None], None]:
+    """Build a SIGINT/SIGTERM handler: the first signal asks the worker to stop
+    after its current job; a second SIGINT aborts immediately."""
+
+    def handle(signum: int, frame: FrameType | None) -> None:
+        if stop.is_set() and signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        stop.set()
+        # os.write, not print or logging: a signal handler can run while the
+        # main thread is in the middle of writing to stderr, and Python's
+        # buffered streams raise on re-entrant writes.
+        try:
+            os.write(2, STOP_MESSAGE)
+        except OSError:
+            pass
+
+    return handle
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     retry_policy = RetryPolicy(base_delay=args.retry_base, max_delay=args.retry_max)
-    run_worker(
-        args.db,
-        worker_id=args.worker_id or default_worker_id(),
-        poll_interval=args.poll_interval,
-        exit_when_idle=args.exit_when_idle,
-        max_jobs=args.max_jobs,
-        lease_seconds=args.lease_seconds,
-        retry_policy=retry_policy,
-    )
+    # A threading.Event is just a flag that is safe to set from a signal
+    # handler; there are no threads. The worker polls it between jobs, and we
+    # never block in stop.wait(), because set() from a handler interrupting
+    # wait() on the same thread could deadlock on the Event's internal lock.
+    stop = threading.Event()
+    handler = make_stop_handler(stop)
+    previous = {sig: signal.signal(sig, handler) for sig in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        run_worker(
+            args.db,
+            worker_id=args.worker_id or default_worker_id(),
+            poll_interval=args.poll_interval,
+            exit_when_idle=args.exit_when_idle,
+            max_jobs=args.max_jobs,
+            should_stop=stop.is_set,
+            lease_seconds=args.lease_seconds,
+            retry_policy=retry_policy,
+        )
+    except KeyboardInterrupt:
+        _error("aborted; a job left running is retried once its lease expires")
+        return 130
+    finally:
+        for sig, old in previous.items():
+            # getsignal() reports None for handlers not installed from Python.
+            signal.signal(sig, old if old is not None else signal.SIG_DFL)
     return EXIT_OK
 
 

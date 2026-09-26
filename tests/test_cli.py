@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import json
+import signal
 import sqlite3
+import threading
 from contextlib import closing
 from pathlib import Path
 
 import pytest
 from conftest import SAMPLES
 
-from taskqueue.cli import main
+from taskqueue.cli import main, make_stop_handler
 from taskqueue.queue import claim_next, enqueue, get_job, list_jobs
 
 
@@ -211,3 +213,19 @@ def test_unopenable_db_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert main(["--db", str(tmp_path), "list"]) == 1  # a directory, not a file
     err = capsys.readouterr().err
     assert "error" in err and "Traceback" not in err
+
+
+def test_stop_handler_first_signal_sets_flag_second_sigint_aborts() -> None:
+    stop = threading.Event()
+    handle = make_stop_handler(stop)
+    handle(signal.SIGTERM, None)
+    assert stop.is_set()
+    handle(signal.SIGTERM, None)  # repeated SIGTERM just keeps asking politely
+    with pytest.raises(KeyboardInterrupt):
+        handle(signal.SIGINT, None)
+
+
+def test_worker_restores_previous_signal_handlers(db_path: Path) -> None:
+    before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
+    assert run(db_path, "worker", "--exit-when-idle") == 0
+    assert (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)) == before
